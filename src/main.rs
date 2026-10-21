@@ -605,12 +605,7 @@ async fn rotate_due_tokens(state: &Arc<proxy::AppState>) {
             Ok(_) => {
                 logging::log_token_rotation(&account.id, &account.label, "rotated", "scheduled")
             }
-            Err(e) => logging::log_token_rotation(
-                &account.id,
-                &account.label,
-                "rotation_failed",
-                &e.to_string(),
-            ),
+            Err(e) => logging::log_token_rotation_failed(&account.id, &account.label, &e),
         }
     }
 }

@@ -12,6 +12,26 @@ use underclass::store::{Store, UsageQuery, UsageRecord};
 use underclass::tokens::{ROTATION_INTERVAL_MS, rotation_due};
 use underclass::usage::{StreamEnd, TokenCounts, UsageDialect, UsageTap};
 
+#[hegel::test]
+fn test_oauth_diagnostics_are_bounded_and_remove_echoed_secrets(tc: TestCase) {
+    let description: String = tc.draw(gs::text());
+    let suffix: u64 = tc.draw(gs::integers::<u64>());
+    let secret = format!("fixture-secret-{suffix}");
+    let body = serde_json::json!({
+        "error": "invalid_grant",
+        "error_description": format!("{description} {secret}"),
+        "nested": {"refresh_token": secret},
+    })
+    .to_string();
+    let error = underclass::oauth::TokenEndpointError::from_body(400, body.as_bytes(), &[]);
+    assert_eq!(error.status(), 400);
+    assert!(!error.to_string().contains(&secret));
+    assert!(!format!("{error:?}").contains(&secret));
+    assert!(error.body_excerpt().len() <= 2048);
+    assert!(error.error().is_none_or(|s| s.len() <= 2048));
+    assert!(error.error_description().is_none_or(|s| s.len() <= 2048));
+}
+
 /// The surfaces the property tests route over: the OpenAI-shaped ones.
 fn openai_surfaces() -> HashMap<BackendId, Vec<Surface>> {
     HashMap::from([

@@ -50,6 +50,8 @@ pub enum AuthError {
     Http(#[from] reqwest::Error),
     #[error("unexpected status {0}")]
     Status(u16),
+    #[error(transparent)]
+    TokenEndpoint(#[from] crate::oauth::TokenEndpointError),
     #[error("authorization failed: {0}")]
     Failed(String),
 }
@@ -95,8 +97,17 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenResponse, AuthError> {
+    exchange_code_at(client, code, verifier, &format!("{ISSUER}/oauth/token")).await
+}
+
+async fn exchange_code_at(
+    client: &Client,
+    code: &str,
+    verifier: &str,
+    token_url: &str,
+) -> Result<TokenResponse, AuthError> {
     let resp = client
-        .post(format!("{ISSUER}/oauth/token"))
+        .post(token_url)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -107,7 +118,11 @@ async fn exchange_code(
         .send()
         .await?;
     if !resp.status().is_success() {
-        return Err(AuthError::Status(resp.status().as_u16()));
+        return Err(
+            crate::oauth::TokenEndpointError::from_response(resp, &[code, verifier])
+                .await
+                .into(),
+        );
     }
     Ok(resp.json().await?)
 }
@@ -121,8 +136,16 @@ pub fn identity_from_token(token: &str) -> Option<String> {
 /// A successful Codex token refresh MUST return a fresh `refresh_token` along with the access
 /// token; the previous refresh token MUST be considered invalidated by the caller.
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenResponse, AuthError> {
+    refresh_at(client, refresh_token, &format!("{ISSUER}/oauth/token")).await
+}
+
+async fn refresh_at(
+    client: &Client,
+    refresh_token: &str,
+    token_url: &str,
+) -> Result<TokenResponse, AuthError> {
     let resp = client
-        .post(format!("{ISSUER}/oauth/token"))
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -131,7 +154,11 @@ pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenRespon
         .send()
         .await?;
     if !resp.status().is_success() {
-        return Err(AuthError::Status(resp.status().as_u16()));
+        return Err(
+            crate::oauth::TokenEndpointError::from_response(resp, &[refresh_token])
+                .await
+                .into(),
+        );
     }
     Ok(resp.json().await?)
 }
@@ -469,6 +496,54 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn token_endpoint_errors_keep_oauth_fields_and_redact_credentials() {
+        let body = serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "The grant expired; request-secret was rejected.",
+            "access_token": "fixture-access",
+            "refresh_token": "fixture-refresh",
+            "id_token": "fixture-id",
+            "code": "fixture-code",
+        })
+        .to_string();
+        let (url, task) = crate::oauth::mock_endpoint(body).await;
+        let client = Client::builder().no_proxy().build().unwrap();
+        let refresh_error = refresh_at(&client, "request-secret", &url)
+            .await
+            .unwrap_err();
+        let exchange_error = exchange_code_at(&client, "request-secret", "fixture-verifier", &url)
+            .await
+            .unwrap_err();
+        for error in [refresh_error, exchange_error] {
+            let token_error = crate::tokens::TokenError::from(error);
+            let detail = token_error
+                .endpoint()
+                .expect("expected token endpoint diagnostics");
+            assert_eq!(detail.status(), 400);
+            assert_eq!(detail.error(), Some("invalid_grant"));
+            assert_eq!(
+                detail.error_description(),
+                Some("The grant expired; [REDACTED] was rejected.")
+            );
+            let display = token_error.to_string();
+            assert!(display.contains("invalid_grant"));
+            assert!(display.contains("The grant expired"));
+            for secret in [
+                "request-secret",
+                "fixture-access",
+                "fixture-refresh",
+                "fixture-id",
+                "fixture-code",
+            ] {
+                assert!(!display.contains(secret));
+                assert!(!format!("{token_error:?}").contains(secret));
+            }
+            crate::oauth::assert_failure_logs(&token_error);
+        }
+        task.abort();
+    }
 
     #[test]
     fn quota_body_deadline_outlasts_short_header() {

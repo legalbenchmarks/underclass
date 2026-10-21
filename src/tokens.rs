@@ -33,6 +33,35 @@ pub enum TokenError {
     MissingToken,
     #[error("token refresh failed: {0}")]
     RefreshFailed(String),
+    #[error("token refresh failed: {0}")]
+    TokenEndpoint(#[from] crate::oauth::TokenEndpointError),
+}
+
+impl From<crate::codex::AuthError> for TokenError {
+    fn from(error: crate::codex::AuthError) -> Self {
+        match error {
+            crate::codex::AuthError::TokenEndpoint(detail) => Self::TokenEndpoint(detail),
+            other => Self::RefreshFailed(other.to_string()),
+        }
+    }
+}
+
+impl From<crate::claude::AuthError> for TokenError {
+    fn from(error: crate::claude::AuthError) -> Self {
+        match error {
+            crate::claude::AuthError::TokenEndpoint(detail) => Self::TokenEndpoint(detail),
+            other => Self::RefreshFailed(other.to_string()),
+        }
+    }
+}
+
+impl TokenError {
+    pub fn endpoint(&self) -> Option<&crate::oauth::TokenEndpointError> {
+        match self {
+            Self::TokenEndpoint(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 pub struct TokenManager {
@@ -123,7 +152,7 @@ impl TokenManager {
             crate::models::BackendId::Codex => {
                 let tokens = crate::codex::refresh(&self.client, &refresh_token)
                     .await
-                    .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
+                    .map_err(TokenError::from)?;
                 let claims = jwt::parse_jwt_claims(&tokens.access_token);
                 let chatgpt_account_id = claims
                     .as_ref()
@@ -144,7 +173,7 @@ impl TokenManager {
             crate::models::BackendId::Claude => {
                 let tokens = crate::claude::refresh(&self.client, &refresh_token)
                     .await
-                    .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
+                    .map_err(TokenError::from)?;
                 let expires_at = now_ms() + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
                 // The Anthropic refresh grant rotates the refresh token: persist the new one
                 // immediately or the account is left holding an invalidated credential.

@@ -65,6 +65,36 @@ pub fn log_account_state(account_id: &str, label: Option<&str>, event: &str, det
     );
 }
 
+/// @cc [owner:ghuntley,label:logging] token-failure-diagnostics
+/// Token failures MUST retain their event name and error display, and expose sanitized token
+/// endpoint status, OAuth error/description and response excerpt as separate structured fields.
+pub fn log_token_failure(request_id: &str, event: &str, error: &crate::tokens::TokenError) {
+    let endpoint = error.endpoint();
+    tracing::warn!(
+        request_id = %request_id,
+        error = %error,
+        status = endpoint.map(|e| e.status()),
+        oauth_error = endpoint.and_then(|e| e.error()),
+        oauth_error_description = endpoint.and_then(|e| e.error_description()),
+        response_body = endpoint.map(|e| e.body_excerpt()),
+        "token.{event}"
+    );
+}
+
+pub fn log_token_rotation_failed(account_id: &str, label: &str, error: &crate::tokens::TokenError) {
+    let endpoint = error.endpoint();
+    tracing::info!(
+        account = %label,
+        account_id = %truncate(account_id),
+        detail = %error,
+        status = endpoint.map(|e| e.status()),
+        oauth_error = endpoint.and_then(|e| e.error()),
+        oauth_error_description = endpoint.and_then(|e| e.error_description()),
+        response_body = endpoint.map(|e| e.body_excerpt()),
+        "token.rotation_failed"
+    );
+}
+
 /// One line per finished response body. Failed, incomplete, or truncated bodies log at warn so
 /// mid-stream upstream failures (e.g. `server_is_overloaded`) are visible despite the 200 status.
 pub fn log_stream_finished(

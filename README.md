@@ -147,6 +147,8 @@ Run `underclass top` (or `utop` from the Nix package) in a second terminal while
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
 
+Failed Claude and Codex token requests include `status`, `oauth_error`, `oauth_error_description`, and a redacted `response_body` in `token.unavailable`, `token.refresh_failed`, and `token.rotation_failed` logs. The sanitized reply also appears in `account.auth_error` detail. Diagnostics read at most 2 KiB with a two-second body timeout. Only JSON OAuth error strings are retained; other fields and credential-shaped text are redacted, and non-JSON, unreadable, or truncated bodies are omitted.
+
 Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact `model`, `account_id`, or `cache_key` filters. Use `missing_key=true` to select requests without a key. Grouped summaries and request details accept `limit` (1–1000, default 100) and `offset`; summary responses also include unpaginated `totals`. With no time bounds, queries default to the current UTC month; provide `from_ms=0` to query all history. Each summary includes measured and unknown request counts. Token totals sum reported values only; they are lower bounds when unknown requests exist. See [ADR 0014](docs/adr/0014-per-attempt-token-accounting.md).
 
 ### Correlation with preflight

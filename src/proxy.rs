@@ -666,14 +666,9 @@ async fn attempt_account(
     let token = match state.tokens.access_token(&account).await {
         Ok(token) => token,
         Err(e) => {
-            tracing::warn!(request_id = %request_id, error = %e, "token.unavailable");
+            logging::log_token_failure(request_id, "unavailable", &e);
             report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-            logging::log_account_state(
-                &selection.account_id,
-                label,
-                "auth_error",
-                "missing or unusable credential",
-            );
+            logging::log_account_state(&selection.account_id, label, "auth_error", &e.to_string());
             drop(guard);
             return Attempt::Failover(None);
         }
@@ -856,13 +851,13 @@ async fn attempt_account(
                 return Attempt::Failover(None);
             }
             Err(e) => {
-                tracing::warn!(request_id = %request_id, error = %e, "token.refresh_failed");
+                logging::log_token_failure(request_id, "refresh_failed", &e);
                 report_outcome(state, &selection.account_id, Outcome::AuthFailed);
                 logging::log_account_state(
                     &selection.account_id,
                     label,
                     "auth_error",
-                    "refresh rejected",
+                    &e.to_string(),
                 );
                 drop(guard);
                 return Attempt::Failover(None);
