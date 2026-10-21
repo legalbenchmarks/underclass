@@ -449,6 +449,8 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
         ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000, 272_000, 128_000),
         ("gpt-6-astra", "GPT-6 Astra", 400_000, 272_000, 128_000),
         ("gpt-6-sol", "GPT-6 Sol", 1_050_000, 922_000, 128_000),
+        // Limits follow gpt-6-sol (upstream PR #26 uses the same values); legalbenchmarks runs it as solver and judge.
+        ("gpt-6.1-sol", "GPT-6.1 Sol", 1_050_000, 922_000, 128_000),
     ];
     entries
         .iter()
@@ -565,6 +567,17 @@ mod tests {
             .expect("gpt-6-sol must be in the default catalog");
         assert_eq!(model.context, 1_050_000);
         assert_eq!(model.input, 922_000);
+        assert_eq!(model.output, 128_000);
+    }
+
+    #[test]
+    fn default_catalog_includes_gpt_6_1_sol() {
+        let model = default_catalog()
+            .into_iter()
+            .find(|model| model.id == "gpt-6.1-sol")
+            .expect("gpt-6.1-sol must be in the default catalog");
+        assert_eq!(model.name, "GPT-6.1 Sol");
+        assert_eq!(model.context, 1_050_000);
         assert_eq!(model.output, 128_000);
     }
 
