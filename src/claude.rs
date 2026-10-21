@@ -223,12 +223,16 @@ impl UsageSnapshot {
     }
 }
 
+/// @cc [owner:ghuntley,label:pool] claude-usage-percentage-normalization
+/// `parse_usage` MUST convert OAuth API percentages (0 to 100) into internal fractions
+/// (0 to 1), including values below 1 percent. Response headers already use fractions.
 /// Parses the account usage payload.
 pub fn parse_usage(body: &Value, now_ms: i64) -> UsageSnapshot {
     let window = |payload: Option<&Value>| UsageWindow {
         utilization: payload
             .and_then(|w| w.get("utilization"))
-            .and_then(Value::as_f64),
+            .and_then(Value::as_f64)
+            .map(|percent| percent / 100.0),
         resets_at_ms: payload
             .and_then(|w| w.get("resets_at"))
             .and_then(Value::as_str)
@@ -1431,9 +1435,9 @@ mod tests {
     fn account_usage_payload_is_parsed() {
         let body = json!({
             "plan_type": "max",
-            "five_hour": {"utilization": 0.07, "resets_at": "2026-10-20T13:00:00Z"},
-            "seven_day": {"utilization": 0.05, "resets_at": "2026-10-27T00:00:00Z"},
-            "seven_day_fable": {"utilization": 1.0, "resets_at": "2026-10-27T00:00:00Z"},
+            "five_hour": {"utilization": 7.0, "resets_at": "2026-10-20T13:00:00Z"},
+            "seven_day": {"utilization": 5.0, "resets_at": "2026-10-27T00:00:00Z"},
+            "seven_day_fable": {"utilization": 100.0, "resets_at": "2026-10-27T00:00:00Z"},
             "rate_limit_reset_credits": {"available_count": 2}
         });
         let snapshot = parse_usage(&body, 1_000);
@@ -1441,6 +1445,25 @@ mod tests {
         assert_eq!(snapshot.five_hour.utilization, Some(0.07));
         assert_eq!(snapshot.reset_credits, Some(2));
         assert!(snapshot.exhausted_reset_ms().is_some());
+    }
+
+    #[test]
+    fn account_usage_percentages_do_not_prematurely_exhaust_accounts() {
+        for percent in [0.0, 0.5, 1.0, 2.0, 84.0, 99.9, 100.0] {
+            let snapshot = parse_usage(
+                &json!({
+                    "five_hour": {"utilization": percent, "resets_at": "2026-10-27T00:00:00Z"}
+                }),
+                1_000,
+            );
+            assert_eq!(snapshot.five_hour.utilization, Some(percent / 100.0));
+            assert_eq!(snapshot.exhausted_reset_ms().is_some(), percent >= 100.0);
+            assert_eq!(
+                usage_view(&snapshot)["five_hour"]["utilization"],
+                percent / 100.0
+            );
+        }
+        assert_eq!(parse_usage(&json!({}), 1_000).five_hour.utilization, None);
     }
 
     #[test]

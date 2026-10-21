@@ -58,7 +58,7 @@
       </div>
     </div>
     <table id="accounts">
-      <thead><tr><th>label</th><th>backend</th><th>plan</th><th>status</th><th>in-flight</th><th>sticky sessions</th><th>renews in</th><th>quota</th><th>Codex usage</th><th>banked resets</th><th></th></tr></thead>
+      <thead><tr><th>label</th><th>backend</th><th>plan</th><th>status</th><th>in-flight</th><th>sticky sessions</th><th>5h</th><th>1 week</th><th>banked resets</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <p class="muted">Healthy accounts serve requests. Quota exhaustion moves an account to <b>cooling</b> until its window resets — it stays configured. <b>auth error</b> accounts need re-login.</p>
@@ -221,27 +221,39 @@ async function api(path, opts = {}) {
   return res;
 }
 
-function fmtReset(ms, row) {
-  if (row.status !== 'cooling' || ms <= 0) return '—';
-  const s = Math.floor(ms / 1000);
-  const m = Math.floor(s / 60), h = Math.floor(m / 60);
-  if (h > 0) return h + 'h ' + (m % 60) + 'm';
-  if (m > 0) return m + 'm ' + (s % 60) + 's';
-  return s + 's';
+function formatRenewal(resetAt, now) {
+  if (typeof resetAt !== 'number' || !Number.isFinite(resetAt) || resetAt <= 0) return 'Renewal unknown';
+  if (resetAt <= now) return 'Awaiting renewal update';
+  const minutes = Math.ceil((resetAt - now) / 60000);
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor(minutes / 60) % 24;
+  if (days > 0) return `Renews in ${days}d ${hours}h`;
+  if (minutes >= 60) return `Renews in ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `Renews in ${minutes}m`;
 }
 
-function formatQuota(o) {
-  if (!o) return '—';
-  const parts = [];
-  const window = (label, w) => {
-    if (w && typeof w.utilization === 'number') parts.push(label + ' ' + Math.round(w.utilization * 100) + '%');
-  };
-  window('5h', o.five_hour);
-  window('7d', o.seven_day);
-  window('7d fable', o.seven_day_fable);
-  if (o.reset_credits) parts.push(o.reset_credits + ' reset' + (o.reset_credits > 1 ? 's' : ''));
-  if (!parts.length) return o.status || '—';
-  return parts.join(' · ');
+// @cc [owner:ghuntley,label:ui] account-quota-remaining
+// Both providers MUST show percent remaining in the matching duration column;
+// each renewal MUST use that same window's deadline, regardless of account status.
+// Absent windows MUST remain unknown rather than imply unused quota.
+function formatRemaining(account, seconds, now = Date.now()) {
+  let used, resetAt;
+  if (account.backend === 'claude') {
+    const key = seconds === 18000 ? 'five_hour' : 'seven_day';
+    const window = account.observation?.[key];
+    const utilization = window?.utilization;
+    resetAt = window?.resets_at_ms;
+    if (typeof utilization === 'number') used = utilization * 100;
+  } else {
+    const limit = account.usage?.rate_limit;
+    const window = [limit?.primary_window, limit?.secondary_window]
+      .find(w => w?.limit_window_seconds === seconds);
+    used = window?.used_percent;
+    if (typeof window?.reset_at === 'number') resetAt = window.reset_at * 1000;
+  }
+  if (typeof used !== 'number' || !Number.isFinite(used)) return '—';
+  const remaining = Math.round(Math.max(0, Math.min(100, 100 - used))) + '% left';
+  return `${remaining}<br><span class="muted">${formatRenewal(resetAt, now)}</span>`;
 }
 
 async function loadState() {
@@ -256,9 +268,8 @@ async function loadState() {
         <td>${esc(a.plan || (a.observation && a.observation.plan) || '—')}</td>
         <td><span class="badge ${a.status}">${a.status}</span></td>
         <td>${a.inflight}</td><td>${a.sticky_sessions}</td>
-        <td>${fmtReset(a.cooling_remaining_ms, a)}</td>
-        <td>${formatQuota(a.observation)}</td>
-        <td>${formatUsage(a.usage)}</td>
+        <td>${formatRemaining(a, 18000)}</td>
+        <td>${formatRemaining(a, 604800)}</td>
         <td>${formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
@@ -418,19 +429,6 @@ async function loadStats() {
     tr.innerHTML = statsCells(name, totals);
     body.appendChild(tr);
   }
-}
-
-function formatUsage(usage) {
-  if (!usage) return '—';
-  const limit = usage.rate_limit;
-  if (!limit) return 'unavailable';
-  const windows = [limit.primary_window, limit.secondary_window].filter(Boolean);
-  const value = windows.map(w => {
-    const hours = w.limit_window_seconds ? Math.round(w.limit_window_seconds / 3600) : '?';
-    const reset = w.reset_at ? new Date(w.reset_at * 1000).toLocaleString() : 'unknown';
-    return `${hours}h: ${Math.max(0, 100 - w.used_percent).toFixed(0)}% left (renews ${reset})`;
-  }).join('<br>');
-  return `${value || 'no windows'}<br><span class="muted">checked ${new Date(usage.fetched_at_ms).toLocaleTimeString()}</span>`;
 }
 
 function formatCredits(usage) {
