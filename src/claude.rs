@@ -897,7 +897,12 @@ fn refresh_body(refresh_token: &str) -> Value {
 
 /// Refreshes an access token. The refresh token rotates, so the caller must persist the new one.
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenResponse, AuthError> {
-    refresh_at(client, refresh_token, TOKEN_URL).await
+    refresh_at(client, refresh_token, &token_url()).await
+}
+
+/// The OAuth token endpoint. Overridable so tests can point at a mock issuer.
+fn token_url() -> String {
+    std::env::var("UNDERCLASS_CLAUDE_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
 }
 
 async fn refresh_at(
@@ -1200,6 +1205,9 @@ pub async fn submit_code(
         }
     };
     store.upsert_account(&account);
+    if let Some(scope) = tokens.scope.as_deref() {
+        store.update_oauth_scope(&account.id, scope);
+    }
     if let Ok(catalog) = fetch_catalog(&client, &account, &tokens.access_token).await
         && !catalog.is_empty()
     {

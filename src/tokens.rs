@@ -62,6 +62,57 @@ impl TokenError {
             _ => None,
         }
     }
+
+    /// Reports whether the issuer rejected the refresh token itself, so only signing in again
+    /// recovers the account.
+    pub fn credential_rejected(&self) -> bool {
+        match self {
+            Self::MissingToken => true,
+            Self::RefreshFailed(_) => false,
+            Self::TokenEndpoint(error) => error
+                .error()
+                .is_some_and(|code| DEAD_CREDENTIAL_ERRORS.contains(&code)),
+        }
+    }
+}
+
+/// OAuth error codes meaning the refresh token is spent, revoked or unknown. Anthropic and
+/// OpenAI both answer `invalid_grant`; OpenAI also names the rotation failures explicitly.
+const DEAD_CREDENTIAL_ERRORS: &[&str] = &[
+    "invalid_grant",
+    "invalid_refresh_token",
+    "refresh_token_reused",
+    "refresh_token_expired",
+    "refresh_token_invalidated",
+];
+
+/// How long an account sits out after a refresh failure that a retry may clear: network
+/// errors, timeouts, 429 and 5xx from the issuer.
+pub const REFRESH_RETRY_BACKOFF_MS: i64 = 60 * 1000;
+
+/// How long an account sits out after the issuer rejects the refresh request itself
+/// (`invalid_scope`, `invalid_client`, any other 4xx) without saying the credential is dead.
+pub const REFRESH_PROTOCOL_BACKOFF_MS: i64 = 15 * 60 * 1000;
+
+/// @cc [owner:ghuntley,label:auth] refresh-failure-outcome
+/// `refresh_failure_outcome` MUST return `AuthFailed` only when the refresh token is missing or
+/// the issuer rejected it (`credential_rejected`). Every other failure MUST return
+/// `QuotaExhausted` with a deadline of `now_ms` plus `REFRESH_RETRY_BACKOFF_MS` (transport errors,
+/// 429, 5xx) or `REFRESH_PROTOCOL_BACKOFF_MS` (other 4xx), so the account cools and rejoins the
+/// pool on its own instead of being stranded in `auth_error` with a working credential.
+pub fn refresh_failure_outcome(error: &TokenError, now_ms: i64) -> crate::models::Outcome {
+    if error.credential_rejected() {
+        return crate::models::Outcome::AuthFailed;
+    }
+    let backoff = match error.endpoint().map(|e| e.status()) {
+        Some(status) if (400..500).contains(&status) && status != 408 && status != 429 => {
+            REFRESH_PROTOCOL_BACKOFF_MS
+        }
+        _ => REFRESH_RETRY_BACKOFF_MS,
+    };
+    crate::models::Outcome::QuotaExhausted {
+        until_ms: now_ms.saturating_add(backoff),
+    }
 }
 
 pub struct TokenManager {
@@ -93,7 +144,9 @@ impl TokenManager {
     /// `PROACTIVE_REFRESH_MARGIN_MS` from expiry, and MUST force a refresh otherwise. For Copilot
     /// it MUST return the stored GitHub token directly (it never expires or refreshes). For Claude
     /// it MUST return the stored OAuth token while it remains valid beyond the same margin, and
-    /// MUST refresh it otherwise.
+    /// MUST refresh it otherwise. An expiring token MUST be refreshed through
+    /// `refresh_if_expiring`, so concurrent callers holding the same stale snapshot share one
+    /// refresh instead of rotating the refresh token once each.
     pub async fn access_token(&self, account: &Account) -> Result<String, TokenError> {
         match account.backend {
             crate::models::BackendId::Copilot => account
@@ -110,7 +163,7 @@ impl TokenManager {
                         return Ok(token.clone());
                     }
                 }
-                self.force_refresh(&account.id).await
+                self.refresh_if_expiring(&account.id).await
             }
             crate::models::BackendId::Claude => {
                 if let Some(token) = &account.access_token {
@@ -122,26 +175,74 @@ impl TokenManager {
                         return Ok(token.clone());
                     }
                 }
-                self.force_refresh(&account.id).await
+                self.refresh_if_expiring(&account.id).await
             }
         }
+    }
+
+    /// @cc [owner:ghuntley,label:auth] refresh-if-expiring-coalesces
+    /// `refresh_if_expiring` MUST take the account's refresh lock, reread the account from the
+    /// store, and return the stored access token without calling the issuer when it is valid
+    /// beyond `PROACTIVE_REFRESH_MARGIN_MS`; otherwise it MUST refresh exactly as `force_refresh`.
+    pub async fn refresh_if_expiring(&self, account_id: &str) -> Result<String, TokenError> {
+        let lock = self.lock_for(account_id);
+        let _guard = lock.lock().await;
+        let account = self
+            .store
+            .get_account(account_id)
+            .ok_or(TokenError::MissingToken)?;
+        if account.backend != crate::models::BackendId::Copilot
+            && let Some(token) = &account.access_token
+            && account
+                .expires_at
+                .saturating_sub(PROACTIVE_REFRESH_MARGIN_MS)
+                > now_ms()
+        {
+            return Ok(token.clone());
+        }
+        self.refresh_locked(account).await
     }
 
     /// @cc [owner:ghuntley,label:auth] force-refresh-single-flight-and-rotation
     /// `force_refresh` MUST serialize refreshes per account (single-flight lock), MUST NOT skip
     /// the refresh based on a still-valid cached token (callers rely on it to recover from 401),
     /// and MUST persist the rotated refresh token, new access token, expiry, `token_refreshed_at`,
-    /// and any newly learned ChatGPT account id/residency to the store before returning the access
-    /// token.
+    /// any granted OAuth scope, and any newly learned ChatGPT account id/residency to the store
+    /// before returning the access token. When the issuer rejects the refresh token but the store
+    /// meanwhile holds a different one (another writer rotated it or the account was signed in
+    /// again), it MUST retry once with the stored token before reporting the rejection.
     pub async fn force_refresh(&self, account_id: &str) -> Result<String, TokenError> {
-        let lock = self.lock_for(account_id).clone();
+        let lock = self.lock_for(account_id);
         let _guard = lock.lock().await;
-
         let account = self
             .store
             .get_account(account_id)
             .ok_or(TokenError::MissingToken)?;
+        self.refresh_locked(account).await
+    }
 
+    /// Refreshes `account`; the caller holds its refresh lock and read it from the store.
+    async fn refresh_locked(&self, account: Account) -> Result<String, TokenError> {
+        let submitted = account.refresh_token.clone();
+        match self.refresh_once(&account).await {
+            Err(error) if error.credential_rejected() => {
+                let current = self.store.get_account(&account.id);
+                match current {
+                    Some(current)
+                        if current.refresh_token.is_some()
+                            && current.refresh_token != submitted =>
+                    {
+                        self.refresh_once(&current).await
+                    }
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn refresh_once(&self, account: &Account) -> Result<String, TokenError> {
+        let account_id = account.id.as_str();
         let refresh_token = account
             .refresh_token
             .clone()
@@ -188,6 +289,9 @@ impl TokenManager {
                     None,
                     None,
                 );
+                if let Some(scope) = tokens.scope.as_deref() {
+                    self.store.update_oauth_scope(account_id, scope);
+                }
                 Ok(tokens.access_token)
             }
         }

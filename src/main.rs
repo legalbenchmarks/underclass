@@ -566,9 +566,11 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
         if let Some(plan) = snapshot.plan.clone()
             && current.plan.as_deref() != Some(plan.as_str())
         {
+            // Only the plan column: `current` is the pool's snapshot, whose tokens may predate a
+            // rotation the usage poll itself just triggered.
+            state.store.update_plan(&account.id, &plan);
             current.plan = Some(plan);
             current.updated_at = models::now_ms();
-            state.store.upsert_account(&current);
             core.sync_account(current.clone());
         }
         if let Some((status, until)) = snapshot.cooling_transition(&current, models::now_ms()) {
@@ -688,14 +690,14 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
         let Some(identity) = identity else {
             continue;
         };
-        let mut updated = account.clone();
-        updated.label = identity;
-        if let Some(plan) = plan {
-            updated.plan = Some(plan);
+        // `account` was read before `access_token` may have rotated its refresh token, so write
+        // only the identity columns and reload the rest from the store.
+        state
+            .store
+            .update_identity(&account.id, &identity, plan.as_deref());
+        if let Some(updated) = state.store.get_account(&account.id) {
+            state.pool.lock().unwrap().sync_account(updated);
         }
-        updated.updated_at = models::now_ms();
-        state.store.upsert_account(&updated);
-        state.pool.lock().unwrap().sync_account(updated);
         tracing::info!(account = %account.id, "account.identity_refreshed");
     }
 }

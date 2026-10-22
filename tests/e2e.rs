@@ -26,6 +26,53 @@ struct MockState {
     /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
     /// credential rejection that a token refresh clears.
     forbidden: std::collections::HashMap<String, u32>,
+    /// Every refresh-grant body the mock Claude token endpoint received.
+    refresh_requests: Vec<serde_json::Value>,
+}
+
+/// The mock Claude OAuth token endpoint. The refresh token's prefix picks the issuer's answer:
+/// `refresh-scope-` is rejected with `invalid_scope`, `refresh-dead-` with `invalid_grant`, and
+/// anything else rotates to `rotated-<token>` with a fresh access token.
+async fn mock_token_endpoint(state: &Arc<Mutex<MockState>>, body: &str) -> Response {
+    // Claude sends JSON; Codex sends a form. Test tokens need no percent-decoding.
+    let request: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|_| {
+        body.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    });
+    let refresh = request["refresh_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    state.lock().unwrap().refresh_requests.push(request);
+    // Slow enough that concurrent callers overlap while the first refresh is in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let reject = |code: &str| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".to_string(),
+            )],
+            format!(r#"{{"error":"{code}","error_description":"rejected by mock issuer"}}"#),
+        )
+            .into_response()
+    };
+    if refresh.starts_with("refresh-scope-") {
+        return reject("invalid_scope");
+    }
+    if refresh.starts_with("refresh-dead-") {
+        return reject("invalid_grant");
+    }
+    axum::Json(serde_json::json!({
+        "access_token": format!("claude-fresh-{refresh}"),
+        "refresh_token": format!("rotated-{refresh}"),
+        "expires_in": 28_800,
+        "scope": "user:inference user:profile",
+    }))
+    .into_response()
 }
 
 async fn mock_responses(
@@ -41,6 +88,10 @@ async fn mock_responses(
         .unwrap_or("unknown")
         .to_string();
     let wants_stream = body.contains("\"stream\": true") || body.contains("\"stream\":true");
+
+    if uri.path() == "/v1/oauth/token" {
+        return mock_token_endpoint(&state, &body).await;
+    }
 
     if bearer.starts_with("bad-") {
         return (
@@ -350,6 +401,14 @@ fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
             std::env::set_var("UNDERCLASS_CODEX_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_CLAUDE_UPSTREAM", format!("http://{addr}"));
+            std::env::set_var(
+                "UNDERCLASS_CLAUDE_TOKEN_URL",
+                format!("http://{addr}/v1/oauth/token"),
+            );
+            std::env::set_var(
+                "UNDERCLASS_CODEX_TOKEN_URL",
+                format!("http://{addr}/v1/oauth/token"),
+            );
         }
         format!("http://{addr}")
     });
@@ -844,12 +903,15 @@ async fn e2e_full_pool_story() {
         assert_eq!(entry.status, 200);
     }
 
-    // phase 7: 401 on one backend fails over and marks auth_error
+    // phase 7: 401 on one backend, then a refresh the issuer rejects (`invalid_grant`), fails
+    // over and marks auth_error
     let store2 = Arc::new(Store::in_memory().unwrap());
     let m2 = model("m");
     store2.set_catalog(BackendId::Codex, &[m2.clone()]);
     store2.set_catalog(BackendId::Copilot, &[m2]);
-    store2.upsert_account(&codex_account("acc-1", "bad-token"));
+    let mut rejected = codex_account("acc-1", "bad-token");
+    rejected.refresh_token = Some("refresh-dead-acc-1".into());
+    store2.upsert_account(&rejected);
     store2.upsert_account(&copilot_account("acc-2", "tok-good"));
     let (base2, _logs2) = spawn_app(store2.clone(), 400).await;
     let resp = http
@@ -1523,4 +1585,162 @@ async fn e2e_anthropic_messages_alias_serves_the_same_surface() {
         .iter()
         .any(|token| token == "claude-alias-token");
     assert!(served, "the alias reached the upstream");
+}
+
+/// Sends one Claude Code request through the Anthropic surface on its own session.
+async fn claude_code_message(base: &str, session: &str) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/messages?beta=true"))
+        .header("Authorization", "Bearer test-key")
+        .header("x-app", "cli")
+        .header("user-agent", "claude-cli/2.1.304 (external, sdk-cli)")
+        .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
+        .header("x-claude-code-session-id", session)
+        .json(&serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or_default())
+}
+
+fn refreshes_of(mock: &Arc<Mutex<MockState>>, refresh_token: &str) -> Vec<serde_json::Value> {
+    mock.lock()
+        .unwrap()
+        .refresh_requests
+        .iter()
+        .filter(|r| r["refresh_token"] == refresh_token)
+        .cloned()
+        .collect()
+}
+
+fn expired_claude(id: &str, refresh_token: &str) -> Account {
+    let mut claude = account(id, BackendId::Claude, &format!("claude-stale-{id}"));
+    claude.refresh_token = Some(refresh_token.into());
+    claude.expires_at = now_ms() - 1_000;
+    claude
+}
+
+/// An expired Claude token is refreshed without a `scope` (the login scope list is rejected with
+/// `invalid_scope`), the rotated refresh token and granted scope are persisted, and concurrent
+/// requests holding the same stale snapshot share a single refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_expired_claude_token_refreshes_once_without_scope() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.upsert_account(&expired_claude("cl-exp", "refresh-ok-exp"));
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+
+    let requests = (0..5).map(|i| {
+        let base = base.clone();
+        async move { claude_code_message(&base, &format!("sess-exp-{i}")).await }
+    });
+    for (status, body) in futures::future::join_all(requests).await {
+        assert_eq!(status, 200, "body: {body}");
+        assert_eq!(body["account"], "claude-fresh-refresh-ok-exp");
+    }
+
+    let refreshes = refreshes_of(mock, "refresh-ok-exp");
+    assert_eq!(
+        refreshes.len(),
+        1,
+        "concurrent callers must share one refresh"
+    );
+    assert!(
+        refreshes[0].get("scope").is_none(),
+        "the refresh grant must not request a scope: {}",
+        refreshes[0]
+    );
+    let stored = store.get_account("cl-exp").unwrap();
+    assert_eq!(
+        stored.refresh_token.as_deref(),
+        Some("rotated-refresh-ok-exp")
+    );
+    assert_eq!(stored.status, AccountStatus::Healthy);
+    assert_eq!(
+        store.oauth_scope("cl-exp").as_deref(),
+        Some("user:inference user:profile"),
+        "the scope the issuer granted is recorded"
+    );
+}
+
+/// A refresh the issuer refuses without rejecting the credential (`invalid_scope`) cools the
+/// account briefly and keeps its refresh token; only `invalid_grant` marks it `auth_error`. Both
+/// fail over to a working account before any byte reaches the client.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_claude_refresh_failures_strand_only_dead_credentials() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    // Both failing accounts sort before the spare, so each is attempted first.
+    store.upsert_account(&expired_claude("cl-a-scope", "refresh-scope-a"));
+    store.upsert_account(&expired_claude("cl-b-dead", "refresh-dead-b"));
+    let mut spare = account("cl-z-spare", BackendId::Claude, "claude-spare-token");
+    spare.refresh_token = Some("refresh-ok-spare".into());
+    store.upsert_account(&spare);
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+
+    let before = now_ms();
+    let (status, body) = claude_code_message(&base, "sess-refresh-failures").await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["account"], "claude-spare-token");
+    assert_eq!(refreshes_of(mock, "refresh-scope-a").len(), 1);
+    assert_eq!(refreshes_of(mock, "refresh-dead-b").len(), 1);
+
+    let scoped = store.get_account("cl-a-scope").unwrap();
+    assert_eq!(
+        scoped.status,
+        AccountStatus::Cooling,
+        "invalid_scope must not strand the account in auth_error"
+    );
+    assert!(
+        scoped.reset_at > before
+            && scoped.reset_at <= now_ms() + underclass::tokens::REFRESH_PROTOCOL_BACKOFF_MS,
+        "the cooldown is bounded: {}",
+        scoped.reset_at
+    );
+    assert_eq!(scoped.refresh_token.as_deref(), Some("refresh-scope-a"));
+
+    let dead = store.get_account("cl-b-dead").unwrap();
+    assert_eq!(
+        dead.status,
+        AccountStatus::AuthError,
+        "invalid_grant means the credential is gone"
+    );
+}
+
+/// A 401 whose forced refresh succeeds is retried on the same account with the new token, even
+/// when it is the only account: the pool's copy of the account must not keep the rejected token,
+/// and the same-account retry must not use up the request's failover budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_unauthorized_retries_same_account_with_refreshed_token() {
+    let mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    // `bad-` access tokens get 401 from the mock; the refresh issues `claude-fresh-...`.
+    let mut claude = account("cl-401", BackendId::Claude, "bad-claude-401");
+    claude.refresh_token = Some("refresh-ok-401".into());
+    store.upsert_account(&claude);
+    let (base, _logs) = spawn_app(store.clone(), 60_000).await;
+
+    let (status, body) = claude_code_message(&base, "sess-401").await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["account"], "claude-fresh-refresh-ok-401");
+    assert_eq!(refreshes_of(mock, "refresh-ok-401").len(), 1);
+    assert_eq!(
+        store.get_account("cl-401").unwrap().status,
+        AccountStatus::Healthy
+    );
+
+    // The next request uses the refreshed token straight away, without another refresh.
+    let (status, body) = claude_code_message(&base, "sess-401-again").await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["account"], "claude-fresh-refresh-ok-401");
+    assert_eq!(refreshes_of(mock, "refresh-ok-401").len(), 1);
 }

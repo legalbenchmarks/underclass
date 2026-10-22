@@ -9,7 +9,10 @@ use underclass::resets::{
 use underclass::stats::{self, Dim};
 use underclass::store::UpstreamEvent;
 use underclass::store::{Store, UsageQuery, UsageRecord};
-use underclass::tokens::{ROTATION_INTERVAL_MS, rotation_due};
+use underclass::tokens::{
+    REFRESH_PROTOCOL_BACKOFF_MS, REFRESH_RETRY_BACKOFF_MS, ROTATION_INTERVAL_MS, TokenError,
+    refresh_failure_outcome, rotation_due,
+};
 use underclass::usage::{StreamEnd, TokenCounts, UsageDialect, UsageTap};
 
 #[hegel::test]
@@ -1130,5 +1133,59 @@ fn test_model_cooldown_scopes_one_model(tc: TestCase) {
         )
         .is_ok(),
         "the cooldown expires on its own"
+    );
+}
+
+/// Only a rejected credential strands an account in `auth_error`. Every other refresh failure,
+/// whatever the issuer's status and error code, cools the account for a bounded time.
+#[hegel::test]
+fn test_refresh_failures_strand_only_rejected_credentials(tc: TestCase) {
+    let now: i64 = tc.draw(gs::integers::<i64>().min_value(0));
+    let status: u16 = tc.draw(gs::integers::<u16>().min_value(400).max_value(599));
+    let code: String = tc.draw(gs::sampled_from(vec![
+        "invalid_grant".to_string(),
+        "invalid_refresh_token".to_string(),
+        "refresh_token_reused".to_string(),
+        "invalid_scope".to_string(),
+        "invalid_client".to_string(),
+        "invalid_request".to_string(),
+        "rate_limited".to_string(),
+        "server_error".to_string(),
+    ]));
+    let dead = matches!(
+        code.as_str(),
+        "invalid_grant" | "invalid_refresh_token" | "refresh_token_reused"
+    );
+    let body = serde_json::json!({"error": code}).to_string();
+    let error = TokenError::TokenEndpoint(underclass::oauth::TokenEndpointError::from_body(
+        status,
+        body.as_bytes(),
+        &[],
+    ));
+    match refresh_failure_outcome(&error, now) {
+        Outcome::AuthFailed => assert!(dead, "{code} at {status} must not strand the account"),
+        Outcome::QuotaExhausted { until_ms } => {
+            assert!(!dead, "{code} means the credential is gone");
+            let retryable = status >= 500 || status == 408 || status == 429;
+            let backoff = if retryable {
+                REFRESH_RETRY_BACKOFF_MS
+            } else {
+                REFRESH_PROTOCOL_BACKOFF_MS
+            };
+            assert_eq!(until_ms, now.saturating_add(backoff));
+        }
+        other => panic!("unexpected outcome {other:?}"),
+    }
+    // Transport failures never carry an issuer verdict and always retry soon.
+    let transport = TokenError::RefreshFailed("connection reset".into());
+    assert_eq!(
+        refresh_failure_outcome(&transport, now),
+        Outcome::QuotaExhausted {
+            until_ms: now.saturating_add(REFRESH_RETRY_BACKOFF_MS)
+        }
+    );
+    assert_eq!(
+        refresh_failure_outcome(&TokenError::MissingToken, now),
+        Outcome::AuthFailed
     );
 }

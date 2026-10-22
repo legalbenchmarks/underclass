@@ -139,6 +139,7 @@ fn schema() -> &'static str {
         plan TEXT,
         status TEXT NOT NULL DEFAULT 'healthy',
         disabled_reason TEXT,
+        oauth_scope TEXT,
         reset_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -238,6 +239,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     if !columns.iter().any(|c| c == "disabled_reason") {
         conn.execute("ALTER TABLE accounts ADD COLUMN disabled_reason TEXT", [])?;
+    }
+    if !columns.iter().any(|c| c == "oauth_scope") {
+        conn.execute("ALTER TABLE accounts ADD COLUMN oauth_scope TEXT", [])?;
     }
     let mut stmt = conn.prepare("PRAGMA table_info(usage_records)")?;
     let columns: Vec<String> = stmt
@@ -926,6 +930,50 @@ impl Store {
         .expect("update disabled reason");
     }
 
+    /// @cc [owner:ghuntley,label:persistence] metadata-writes-spare-credentials
+    /// `update_plan`, `update_identity` and `update_oauth_scope` MUST write only their own columns
+    /// (and `updated_at`): a caller holding an older account snapshot MUST NOT be able to restore
+    /// a rotated-away refresh or access token through them.
+    pub fn update_plan(&self, id: &str, plan: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET plan = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, plan, crate::models::now_ms()],
+        )
+        .expect("update plan");
+    }
+
+    pub fn update_identity(&self, id: &str, label: &str, plan: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET label = ?2, plan = COALESCE(?3, plan), updated_at = ?4 WHERE id = ?1",
+            params![id, label, plan, crate::models::now_ms()],
+        )
+        .expect("update identity");
+    }
+
+    /// Records the scope the issuer granted, as it reported it; never the scope underclass asked for.
+    pub fn update_oauth_scope(&self, id: &str, scope: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE accounts SET oauth_scope = ?2 WHERE id = ?1",
+            params![id, scope],
+        )
+        .expect("update oauth scope");
+    }
+
+    pub fn oauth_scope(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT oauth_scope FROM accounts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("query oauth scope")
+        .flatten()
+    }
+
     /// @cc [owner:ghuntley,label:persistence] token-rotation-write-through
     /// `update_tokens` MUST persist the new access token, expiry, `token_refreshed_at`, and (when
     /// present) rotated refresh token, ChatGPT account id, and residency immediately; a `None`
@@ -1087,6 +1135,40 @@ fn parse_status(s: &str) -> AccountStatus {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn metadata_writes_leave_rotated_tokens_alone() {
+        let store = Store::in_memory().unwrap();
+        let mut account = crate::flows::new_account(crate::models::BackendId::Claude, "a@b".into());
+        account.refresh_token = Some("refresh-old".into());
+        account.access_token = Some("access-old".into());
+        store.upsert_account(&account);
+        store.update_tokens(
+            &account.id,
+            Some("refresh-new"),
+            Some("access-new"),
+            42,
+            None,
+            None,
+        );
+
+        // Callers holding the pre-rotation snapshot only touch their own columns.
+        store.update_plan(&account.id, "max");
+        store.update_identity(&account.id, "owner@example.test", None);
+        store.update_oauth_scope(&account.id, "user:inference");
+
+        let stored = store.get_account(&account.id).unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(stored.access_token.as_deref(), Some("access-new"));
+        assert_eq!(stored.expires_at, 42);
+        assert_eq!(stored.plan.as_deref(), Some("max"));
+        assert_eq!(stored.label, "owner@example.test");
+        assert_eq!(
+            store.oauth_scope(&account.id).as_deref(),
+            Some("user:inference")
+        );
+    }
+
     use super::{Store, UsageQuery, UsageRecord};
 
     /// A store created before `token_refreshed_at` existed must gain the column on open, keep its
