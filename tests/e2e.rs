@@ -370,6 +370,7 @@ fn account(id: &str, backend: BackendId, token: &str) -> Account {
         residency: None,
         enterprise_url: None,
         plan: None,
+        disabled_reason: None,
         status: AccountStatus::Healthy,
         reset_at: 0,
         created_at: ts,
