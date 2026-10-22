@@ -136,7 +136,12 @@ pub fn identity_from_token(token: &str) -> Option<String> {
 /// A successful Codex token refresh MUST return a fresh `refresh_token` along with the access
 /// token; the previous refresh token MUST be considered invalidated by the caller.
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenResponse, AuthError> {
-    refresh_at(client, refresh_token, &format!("{ISSUER}/oauth/token")).await
+    refresh_at(client, refresh_token, &refresh_url()).await
+}
+
+/// The refresh grant's endpoint. Overridable so tests can point at a mock issuer.
+fn refresh_url() -> String {
+    std::env::var("UNDERCLASS_CODEX_TOKEN_URL").unwrap_or_else(|_| format!("{ISSUER}/oauth/token"))
 }
 
 async fn refresh_at(

@@ -323,6 +323,9 @@ fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
 enum Attempt {
     Respond(Response),
     Failover(Option<Response>),
+    /// The upstream rejected the credential and a forced refresh succeeded: the same account is
+    /// retried once with the new token, on an attempt of its own.
+    Refreshed,
     /// The stream failed with a capacity code before any output; `replay` holds what upstream
     /// sent, for the client if no other account succeeds.
     Overloaded {
@@ -578,6 +581,8 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 overloaded.insert(account_id);
                 last_upstream = Some(replay);
             }
+            // Bounded: `refreshed` admits one forced refresh per account per request.
+            Attempt::Refreshed => max_attempts += 1,
             Attempt::Failover(passthrough) => {
                 last_upstream = passthrough.or(last_upstream);
                 if attempts == max_attempts && !reset_after_quota {
@@ -624,14 +629,16 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
 
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
 /// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
-/// after a successful banked reset, and the first successful upstream response MUST be returned
+/// after a successful banked reset and one per account whose credential was refreshed after a 401
+/// or 403, and the first successful upstream response MUST be returned
 /// to the client; a 2xx stream that fails with a capacity code before any output is not successful:
 /// the account MUST be excluded for the rest of the request (without changing its health) and
 /// the next account tried. Upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
 /// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
-/// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
-/// account `AuthFailed` and fail over.
+/// same-account retry per request; a second 401 or 403 MUST classify the account `AuthFailed` and
+/// fail over. A failed refresh MUST fail over and report `tokens::refresh_failure_outcome`, so only
+/// a rejected credential marks the account `auth_error`.
 async fn attempt_account(
     state: &Arc<AppState>,
     request_id: &str,
@@ -670,11 +677,17 @@ async fn attempt_account(
     };
 
     let token = match state.tokens.access_token(&account).await {
-        Ok(token) => token,
+        Ok(token) => {
+            // A refresh wrote new credentials to the store; the pool's copy still holds the old
+            // ones until the housekeeping tick, so later requests would refresh again.
+            if account.access_token.as_deref() != Some(token.as_str()) {
+                sync_account_from_store(state, &selection.account_id);
+            }
+            token
+        }
         Err(e) => {
             logging::log_token_failure(request_id, "unavailable", &e);
-            report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-            logging::log_account_state(&selection.account_id, label, "auth_error", &e.to_string());
+            report_refresh_failure(state, &selection.account_id, label, &e);
             drop(guard);
             return Attempt::Failover(None);
         }
@@ -854,19 +867,14 @@ async fn attempt_account(
         persist_usage(&state.store, &record);
         match state.tokens.force_refresh(&selection.account_id).await {
             Ok(_) => {
+                sync_account_from_store(state, &selection.account_id);
                 report_outcome(state, &selection.account_id, Outcome::Transient);
                 drop(guard);
-                return Attempt::Failover(None);
+                return Attempt::Refreshed;
             }
             Err(e) => {
                 logging::log_token_failure(request_id, "refresh_failed", &e);
-                report_outcome(state, &selection.account_id, Outcome::AuthFailed);
-                logging::log_account_state(
-                    &selection.account_id,
-                    label,
-                    "auth_error",
-                    &e.to_string(),
-                );
+                report_refresh_failure(state, &selection.account_id, label, &e);
                 drop(guard);
                 return Attempt::Failover(None);
             }
@@ -1221,6 +1229,33 @@ fn observe_response(
         "cooling",
         &format!("upstream window exhausted until {until}"),
     );
+}
+
+/// Reloads one account from the store into the pool, keeping its in-flight count.
+fn sync_account_from_store(state: &Arc<AppState>, account_id: &str) {
+    if let Some(account) = state.store.get_account(account_id) {
+        state.pool.lock().unwrap().sync_account(account);
+    }
+}
+
+/// Takes an account out of rotation after its token could not be refreshed: `auth_error` when the
+/// issuer rejected the credential, otherwise a short cooldown that the housekeeping tick lifts.
+fn report_refresh_failure(
+    state: &Arc<AppState>,
+    account_id: &str,
+    label: Option<&str>,
+    error: &crate::tokens::TokenError,
+) {
+    let outcome = crate::tokens::refresh_failure_outcome(error, now_ms());
+    let (state_name, detail) = match &outcome {
+        Outcome::QuotaExhausted { until_ms } => (
+            "refresh_backoff",
+            format!("{error}; retrying after {until_ms}"),
+        ),
+        _ => ("auth_error", error.to_string()),
+    };
+    report_outcome(state, account_id, outcome);
+    logging::log_account_state(account_id, label, state_name, &detail);
 }
 
 fn report_outcome(state: &Arc<AppState>, account_id: &str, outcome: Outcome) {

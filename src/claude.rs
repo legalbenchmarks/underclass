@@ -333,6 +333,8 @@ impl UsageSnapshot {
 /// Parses the account usage payload.
 pub fn parse_usage(body: &Value, now_ms: i64) -> UsageSnapshot {
     let window = |payload: Option<&Value>| UsageWindow {
+        // The usage API reports percent (`26.0`); everything downstream, like the unified
+        // rate-limit headers, works in fractions of the window.
         utilization: payload
             .and_then(|w| w.get("utilization"))
             .and_then(Value::as_f64)
@@ -881,9 +883,26 @@ async fn exchange_at(
     Ok(resp.json().await?)
 }
 
+/// @cc [owner:ghuntley,label:auth] claude-refresh-keeps-granted-scopes
+/// `refresh_body` MUST NOT request a `scope`: the refresh grant keeps the scopes granted at
+/// login, and the token endpoint rejects the login scope list (`org:create_api_key` is never
+/// granted) with `invalid_scope`, which left accounts with an expired token.
+fn refresh_body(refresh_token: &str) -> Value {
+    json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    })
+}
+
 /// Refreshes an access token. The refresh token rotates, so the caller must persist the new one.
 pub async fn refresh(client: &Client, refresh_token: &str) -> Result<TokenResponse, AuthError> {
-    refresh_at(client, refresh_token, TOKEN_URL).await
+    refresh_at(client, refresh_token, &token_url()).await
+}
+
+/// The OAuth token endpoint. Overridable so tests can point at a mock issuer.
+fn token_url() -> String {
+    std::env::var("UNDERCLASS_CLAUDE_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
 }
 
 async fn refresh_at(
@@ -894,12 +913,7 @@ async fn refresh_at(
     let resp = client
         .post(token_url)
         .header("content-type", "application/json")
-        .json(&json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "scope": SCOPES,
-        }))
+        .json(&refresh_body(refresh_token))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -1191,6 +1205,9 @@ pub async fn submit_code(
         }
     };
     store.upsert_account(&account);
+    if let Some(scope) = tokens.scope.as_deref() {
+        store.update_oauth_scope(&account.id, scope);
+    }
     if let Ok(catalog) = fetch_catalog(&client, &account, &tokens.access_token).await
         && !catalog.is_empty()
     {
@@ -1755,6 +1772,25 @@ mod tests {
             );
         }
         assert_eq!(parse_usage(&json!({}), 1_000).five_hour.utilization, None);
+    }
+
+    #[test]
+    fn partly_used_windows_are_not_exhausted() {
+        // Observed in production: 2% and 26% used must not cool the account until the weekly reset.
+        let body = json!({
+            "five_hour": {"utilization": 2.0, "resets_at": "2026-10-22T06:59:59Z"},
+            "seven_day": {"utilization": 26.0, "resets_at": "2026-10-23T03:59:59Z"},
+        });
+        let snapshot = parse_usage(&body, 1_000);
+        assert_eq!(snapshot.seven_day.utilization, Some(0.26));
+        assert_eq!(snapshot.exhausted_reset_ms(), None);
+    }
+
+    #[test]
+    fn refresh_requests_no_scope() {
+        let body = refresh_body("refresh");
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert!(body.get("scope").is_none());
     }
 
     #[test]

@@ -220,6 +220,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                     pool::BINDING_TTL_MS,
                     pool::DEFAULT_BINDING_CAP,
                 );
+                enforce_plan_gates(&state);
                 state.pool.lock().unwrap().sync_from_store(&store);
             }
         });
@@ -529,11 +530,29 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
         .filter(|a| a.status != models::AccountStatus::Disabled)
         .collect();
     for account in accounts {
-        let Ok(token) = state.tokens.access_token(&account).await else {
-            continue;
+        let token = match state.tokens.access_token(&account).await {
+            Ok(token) => token,
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
-        let Ok(snapshot) = claude::fetch_usage(&state.client, &account, &token).await else {
-            continue;
+        let snapshot = match claude::fetch_usage(&state.client, &account, &token).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                logging::log_account_state(
+                    &account.id,
+                    Some(&account.label),
+                    "usage_poll_failed",
+                    &e.to_string(),
+                );
+                continue;
+            }
         };
         state
             .observations
@@ -547,9 +566,11 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
         if let Some(plan) = snapshot.plan.clone()
             && current.plan.as_deref() != Some(plan.as_str())
         {
+            // Only the plan column: `current` is the pool's snapshot, whose tokens may predate a
+            // rotation the usage poll itself just triggered.
+            state.store.update_plan(&account.id, &plan);
             current.plan = Some(plan);
             current.updated_at = models::now_ms();
-            state.store.upsert_account(&current);
             core.sync_account(current.clone());
         }
         if let Some((status, until)) = snapshot.cooling_transition(&current, models::now_ms()) {
@@ -568,6 +589,38 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
                 &format!("subscription usage reconciled until {until}"),
             );
         }
+    }
+}
+
+/// Disables accounts on a free plan and re-enables those it disabled once they are upgraded.
+///
+/// Codex plans come from the stored access token's claims, which the daily scheduled rotation
+/// keeps current even while the account is disabled.
+fn enforce_plan_gates(state: &Arc<proxy::AppState>) {
+    for account in state.store.list_accounts() {
+        let (status, reason, event) = match account.plan_gate() {
+            Some(models::PlanGate::Disable) => (
+                models::AccountStatus::Disabled,
+                Some(models::FREE_PLAN_REASON),
+                "disabled",
+            ),
+            Some(models::PlanGate::Enable) => (models::AccountStatus::Healthy, None, "enabled"),
+            None => continue,
+        };
+        let plan = account.plan_label().unwrap_or_default();
+        state.store.update_account_status(&account.id, status, 0);
+        state.store.set_disabled_reason(&account.id, reason);
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .set_status(&account.id, status, 0);
+        logging::log_account_state(
+            &account.id,
+            Some(&account.label),
+            event,
+            &format!("subscription plan is {plan}"),
+        );
     }
 }
 
@@ -637,14 +690,14 @@ async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
         let Some(identity) = identity else {
             continue;
         };
-        let mut updated = account.clone();
-        updated.label = identity;
-        if let Some(plan) = plan {
-            updated.plan = Some(plan);
+        // `account` was read before `access_token` may have rotated its refresh token, so write
+        // only the identity columns and reload the rest from the store.
+        state
+            .store
+            .update_identity(&account.id, &identity, plan.as_deref());
+        if let Some(updated) = state.store.get_account(&account.id) {
+            state.pool.lock().unwrap().sync_account(updated);
         }
-        updated.updated_at = models::now_ms();
-        state.store.upsert_account(&updated);
-        state.pool.lock().unwrap().sync_account(updated);
         tracing::info!(account = %account.id, "account.identity_refreshed");
     }
 }
