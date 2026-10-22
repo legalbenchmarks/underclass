@@ -459,7 +459,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
     let mut reset_after_quota = false;
     let mut attempts = 0;
     let mut max_attempts = total_accounts;
-    // Accounts whose stream failed with a capacity code before output, skipped for this request.
+    // Accounts with a transient backoff or a pre-output capacity failure, skipped for this request.
     let mut overloaded: std::collections::HashSet<String> = Default::default();
 
     while attempts < max_attempts {
@@ -592,6 +592,12 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 }
             }
         }
+    }
+
+    if !overloaded.is_empty()
+        && let Some(replay) = last_upstream.take()
+    {
+        return attach_request_id(replay, &request_id);
     }
 
     let saturated = state
@@ -815,13 +821,15 @@ async fn attempt_account(
 
     let response_headers = response.headers().clone();
     let status = response.status();
-    observe_response(
-        state,
-        &*backend,
-        &account,
-        &selection.account_id,
-        &response_headers,
-    );
+    if status.is_success() {
+        observe_response(
+            state,
+            &*backend,
+            &account,
+            &selection.account_id,
+            &response_headers,
+        );
+    }
 
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         && refreshed.insert(selection.account_id.clone())
@@ -899,6 +907,16 @@ async fn attempt_account(
             ));
         }
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
+        let transient_backoff = matches!(outcome, Outcome::Transient)
+            .then(|| backend.transient_backoff_until_ms(&resp_headers, now_ms()))
+            .flatten();
+        if let Some(until_ms) = transient_backoff {
+            state
+                .pool
+                .lock()
+                .unwrap()
+                .report_model_quota(&selection.account_id, model, until_ms);
+        }
         if let Outcome::ModelQuotaExhausted { until_ms } = outcome {
             state
                 .pool
@@ -965,7 +983,7 @@ async fn attempt_account(
             status.as_u16(),
             started.elapsed().as_millis() as u64,
         );
-        Attempt::Failover(Some(upstream_error_response(
+        let replay = upstream_error_response(
             status,
             &resp_headers
                 .get(http::header::CONTENT_TYPE)
@@ -973,7 +991,15 @@ async fn attempt_account(
                 .unwrap_or("application/json")
                 .to_string(),
             body_text,
-        )))
+        );
+        if transient_backoff.is_some() {
+            Attempt::Overloaded {
+                account_id: selection.account_id.clone(),
+                replay,
+            }
+        } else {
+            Attempt::Failover(Some(replay))
+        }
     } else {
         let content_type = response
             .headers()
@@ -1175,26 +1201,20 @@ fn observe_response(
     if until <= now {
         return;
     }
-    let current = {
-        state
-            .pool
-            .lock()
-            .unwrap()
-            .account(account_id)
-            .map(|a| a.reset_at)
-            .unwrap_or(0)
-    };
-    if until <= current {
+    let mut core = state.pool.lock().unwrap();
+    let Some(current) = core.account(account_id) else {
         return;
-    }
-    state
-        .pool
-        .lock()
-        .unwrap()
-        .set_status(account_id, AccountStatus::Cooling, until);
+    };
+    let Some(deadline) =
+        crate::resets::blocked_cooling_deadline(current.status, current.reset_at, until)
+    else {
+        return;
+    };
+    core.set_status(account_id, AccountStatus::Cooling, deadline);
     state
         .store
-        .update_account_status(account_id, AccountStatus::Cooling, until);
+        .update_account_status(account_id, AccountStatus::Cooling, deadline);
+    drop(core);
     logging::log_account_state(
         account_id,
         Some(&account.label),

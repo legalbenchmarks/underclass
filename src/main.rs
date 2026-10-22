@@ -540,48 +540,34 @@ async fn poll_claude_usage(state: &Arc<proxy::AppState>) {
             .lock()
             .unwrap()
             .insert(account.id.clone(), claude::usage_view(&snapshot));
+        let mut core = state.pool.lock().unwrap();
+        let Some(mut current) = core.account(&account.id).cloned() else {
+            continue;
+        };
         if let Some(plan) = snapshot.plan.clone()
-            && account.plan.as_deref() != Some(plan.as_str())
+            && current.plan.as_deref() != Some(plan.as_str())
         {
-            let mut updated = account.clone();
-            updated.plan = Some(plan);
-            updated.updated_at = models::now_ms();
-            state.store.upsert_account(&updated);
-            state.pool.lock().unwrap().sync_account(updated);
+            current.plan = Some(plan);
+            current.updated_at = models::now_ms();
+            state.store.upsert_account(&current);
+            core.sync_account(current.clone());
         }
-        let Some(until) = snapshot.exhausted_reset_ms() else {
-            continue;
-        };
-        let now = models::now_ms();
-        if until <= now {
-            continue;
-        }
-        let current = {
+        if let Some((status, until)) = snapshot.cooling_transition(&current, models::now_ms()) {
+            core.set_status(&account.id, status, until);
             state
-                .pool
-                .lock()
-                .unwrap()
-                .account(&account.id)
-                .map(|a| a.reset_at)
-                .unwrap_or(0)
-        };
-        if until <= current {
-            continue;
+                .store
+                .update_account_status(&account.id, status, until);
+            logging::log_account_state(
+                &account.id,
+                Some(&account.label),
+                if status == models::AccountStatus::Cooling {
+                    "cooling"
+                } else {
+                    "healthy"
+                },
+                &format!("subscription usage reconciled until {until}"),
+            );
         }
-        state
-            .pool
-            .lock()
-            .unwrap()
-            .set_status(&account.id, models::AccountStatus::Cooling, until);
-        state
-            .store
-            .update_account_status(&account.id, models::AccountStatus::Cooling, until);
-        logging::log_account_state(
-            &account.id,
-            Some(&account.label),
-            "cooling",
-            &format!("subscription window exhausted until {until}"),
-        );
     }
 }
 

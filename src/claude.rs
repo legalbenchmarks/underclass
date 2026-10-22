@@ -1,5 +1,5 @@
 use crate::flows::{FlowRegistry, FlowState, OAuthState};
-use crate::models::{Account, BackendId, ModelInfo, Outcome, Surface, now_ms};
+use crate::models::{Account, AccountStatus, BackendId, ModelInfo, Outcome, Surface, now_ms};
 use crate::provider::Backend;
 use crate::store::Store;
 use crate::usage::UsageDialect;
@@ -167,6 +167,74 @@ pub fn quota_scope(headers: &HeaderMap, body: &str) -> QuotaScope {
     QuotaScope::Unknown
 }
 
+/// Temporary capacity signals take precedence over subscription quota headers.
+fn temporarily_limited(body: &str) -> bool {
+    let text = body.to_ascii_lowercase();
+    [
+        "overloaded_error",
+        "temporarily limiting requests",
+        "not your usage limit",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// @cc [owner:ghuntley,label:pool] claude-shared-reset-evidence
+/// A shared-window reset MUST be used only when that window has at least 99% utilization,
+/// an explicit rejected status, or an explicit limit-reached message. A generic rejected
+/// status or reset MUST NOT prove that either shared window is exhausted.
+fn shared_quota_reset_ms(headers: &HeaderMap, body: &str) -> Option<i64> {
+    let text = body.to_ascii_lowercase();
+    let limit_reached =
+        text.contains("reached") || text.contains("exceeded") || text.contains("hit your");
+    [
+        (
+            UNIFIED_5H_UTILIZATION,
+            UNIFIED_5H_RESET,
+            "anthropic-ratelimit-unified-5h-status",
+            "five_hour",
+            &[
+                "5-hour limit",
+                "five-hour limit",
+                "5 hour limit",
+                "session limit",
+            ][..],
+        ),
+        (
+            UNIFIED_7D_UTILIZATION,
+            UNIFIED_7D_RESET,
+            "anthropic-ratelimit-unified-7d-status",
+            "seven_day",
+            &[
+                "weekly limit",
+                "weekly usage limit",
+                "7-day limit",
+                "seven-day limit",
+            ][..],
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(utilization, reset, status, claim, phrases)| {
+        let exhausted = header_value(headers, utilization)
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|value| value >= 0.99)
+            || status_rejected(headers, status)
+            || (limit_reached && phrases.iter().any(|phrase| text.contains(phrase)));
+        if !exhausted {
+            return None;
+        }
+        header_value(headers, reset)
+            .or_else(|| {
+                (header_value(headers, UNIFIED_CLAIM).as_deref() == Some(claim))
+                    .then(|| header_value(headers, UNIFIED_RESET))
+                    .flatten()
+            })
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|seconds| seconds.saturating_mul(1000))
+    })
+    .max()
+}
+
 /// A quota window as the response headers report it.
 fn header_window(headers: &HeaderMap, utilization: &str, reset: &str) -> Option<UsageWindow> {
     let utilization: f64 = header_value(headers, utilization)?.parse().ok()?;
@@ -207,7 +275,43 @@ pub struct UsageSnapshot {
 }
 
 impl UsageSnapshot {
-    /// The earliest reset among the windows that are fully consumed.
+    /// @cc [owner:ghuntley,label:pool] claude-usage-cooling-reconciliation
+    /// Fresh usage MUST readmit Cooling accounts only when both shared windows have known
+    /// utilization below 99% and no observed model window is exhausted. Exhausted windows MAY
+    /// extend but MUST NOT shorten cooling. AuthError and Disabled MUST remain unchanged;
+    /// missing or invalid utilization MUST NOT count as headroom.
+    pub fn cooling_transition(&self, account: &Account, now: i64) -> Option<(AccountStatus, i64)> {
+        if !matches!(
+            account.status,
+            AccountStatus::Healthy | AccountStatus::Cooling
+        ) {
+            return None;
+        }
+        if let Some(until) = self.exhausted_reset_ms().filter(|until| *until > now) {
+            return crate::resets::blocked_cooling_deadline(
+                account.status,
+                account.reset_at,
+                until,
+            )
+            .map(|deadline| (AccountStatus::Cooling, deadline));
+        }
+        let headroom = [&self.five_hour, &self.seven_day]
+            .into_iter()
+            .all(|window| {
+                window
+                    .utilization
+                    .is_some_and(|value| (0.0..0.99).contains(&value))
+            });
+        let model_headroom = self
+            .seven_day_fable
+            .utilization
+            .is_none_or(|value| (0.0..0.99).contains(&value));
+        // Cooling is quota-only; credential failures and operator disables have distinct states.
+        (account.status == AccountStatus::Cooling && headroom && model_headroom)
+            .then_some((AccountStatus::Healthy, 0))
+    }
+
+    /// The latest reset among the windows that are fully consumed.
     pub fn exhausted_reset_ms(&self) -> Option<i64> {
         [&self.five_hour, &self.seven_day, &self.seven_day_fable]
             .into_iter()
@@ -219,7 +323,7 @@ impl UsageSnapshot {
                     None
                 }
             })
-            .min()
+            .max()
     }
 }
 
@@ -1198,28 +1302,43 @@ impl Backend for ClaudeBackend {
     }
 
     /// @cc [owner:ghuntley,label:pool] claude-classify-window-quota
-    /// `classify` MUST treat a 429 that carries Anthropic's unified rate-limit headers as
-    /// `QuotaExhausted` until the reported window reset, MUST treat a 429 without them as a
-    /// credential rejection that is transient rather than a quota exhaustion, and MUST leave
-    /// 5xx (including the 529 overload) transient.
+    /// Overload (529, overloaded_error, or temporary limiting messages) MUST be Transient even
+    /// with rejected quota headers. Auth failures MUST stay AuthFailed. Shared quota cooling
+    /// MUST use only evidence-backed window resets; ambiguous 429s MUST remain Transient.
     fn classify(&self, status: u16, body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
+        if matches!(status, 401 | 403) {
+            return Outcome::AuthFailed;
+        }
+        if status == 529 || (status >= 400 && temporarily_limited(body)) {
+            return Outcome::Transient;
+        }
         if status == 429 {
-            let until = || {
-                unified_reset_ms(headers)
-                    .or_else(|| crate::health::parse_retry_after_headers(headers, now_ms))
-                    .unwrap_or_else(|| now_ms.saturating_add(self.cooldown_ms))
-                    .max(now_ms)
-            };
-            return match quota_scope(headers, body) {
-                // The shared window is exhausted: every model on this account is blocked.
-                QuotaScope::Credential => Outcome::QuotaExhausted { until_ms: until() },
-                // Only this model is refused: the account keeps serving its other models.
-                QuotaScope::Model => Outcome::ModelQuotaExhausted { until_ms: until() },
-                // The request was refused, or nothing says what was exhausted.
-                QuotaScope::Request | QuotaScope::Unknown => Outcome::Transient,
+            let scope = quota_scope(headers, body);
+            if let Some(until_ms) =
+                shared_quota_reset_ms(headers, body).filter(|until| *until > now_ms)
+            {
+                return Outcome::QuotaExhausted { until_ms };
+            }
+            return match scope {
+                QuotaScope::Model => Outcome::ModelQuotaExhausted {
+                    until_ms: unified_reset_ms(headers)
+                        .or_else(|| crate::health::parse_retry_after_headers(headers, now_ms))
+                        .unwrap_or_else(|| now_ms.saturating_add(self.cooldown_ms))
+                        .max(now_ms),
+                },
+                _ => Outcome::Transient,
             };
         }
         crate::health::classify(status, headers, self.cooldown_ms, now_ms)
+    }
+
+    /// @cc [owner:ghuntley,label:pool] claude-transient-backoff
+    /// A transient response MUST back off using Retry-After or 60 seconds, never a quota reset.
+    fn transient_backoff_until_ms(&self, headers: &HeaderMap, now_ms: i64) -> Option<i64> {
+        Some(
+            crate::health::parse_retry_after_headers(headers, now_ms)
+                .unwrap_or_else(|| now_ms.saturating_add(60_000)),
+        )
     }
 
     /// @cc [owner:ghuntley,label:pool] claude-quota-observation
@@ -1238,8 +1357,8 @@ impl Backend for ClaudeBackend {
     }
 
     /// @cc [owner:ghuntley,label:pool] claude-exhausted-window-cooling
-    /// `exhausted_until_ms` MUST return the reset of a fully consumed subscription window, so
-    /// the account leaves rotation until the window resets instead of failing a request.
+    /// `exhausted_until_ms` MUST return the latest reset among fully consumed shared windows;
+    /// a window with headroom MUST NOT extend the account's proactive cooling.
     fn exhausted_until_ms(&self, headers: &HeaderMap) -> Option<i64> {
         [
             header_window(headers, UNIFIED_5H_UTILIZATION, UNIFIED_5H_RESET),
@@ -1249,7 +1368,7 @@ impl Backend for ClaudeBackend {
         .flatten()
         .filter(|window| window.utilization.unwrap_or_default() >= 1.0)
         .filter_map(|window| window.resets_at_ms)
-        .min()
+        .max()
     }
 }
 
@@ -1324,13 +1443,17 @@ mod tests {
     }
 
     #[test]
-    fn window_quota_uses_the_unified_reset() {
+    fn window_quota_uses_only_the_evidenced_window_reset() {
         let backend = ClaudeBackend {
             cooldown_ms: 30_000,
         };
         let map = headers(&[
             ("anthropic-ratelimit-unified-status", "rejected"),
-            ("anthropic-ratelimit-unified-reset", "1792506000"),
+            ("anthropic-ratelimit-unified-reset", "1792728000"),
+            (UNIFIED_5H_UTILIZATION, "0.99"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "0.18"),
+            (UNIFIED_7D_RESET, "1792728000"),
         ]);
         assert!(matches!(
             backend.classify(429, "{}", &map, 1_000),
@@ -1368,6 +1491,143 @@ mod tests {
     }
 
     #[test]
+    fn temporary_limits_override_quota_headers_and_honor_retry_after() {
+        let backend = ClaudeBackend {
+            cooldown_ms: 1_800_000,
+        };
+        let mut map = headers(&[
+            (UNIFIED_STATUS, "rejected"),
+            (UNIFIED_RESET, "1792728000"),
+            (UNIFIED_5H_UTILIZATION, "0.23"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "0.18"),
+            (UNIFIED_7D_RESET, "1792728000"),
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+        ]);
+        for (status, body) in [
+            (
+                429,
+                r#"{"error":{"message":"Server is temporarily limiting requests (not your usage limit)"}}"#,
+            ),
+            (429, r#"{"error":{"type":"overloaded_error"}}"#),
+            (529, "{}"),
+        ] {
+            assert_eq!(
+                backend.classify(status, body, &map, 1_000),
+                Outcome::Transient
+            );
+            assert_eq!(
+                backend.transient_backoff_until_ms(&map, 1_000),
+                Some(61_000)
+            );
+        }
+        map.insert("retry-after", http::HeaderValue::from_static("45"));
+        assert_eq!(
+            backend.transient_backoff_until_ms(&map, 1_000),
+            Some(46_000)
+        );
+        for status in [401, 403] {
+            assert_eq!(
+                backend.classify(status, "overloaded_error", &map, 1_000),
+                Outcome::AuthFailed
+            );
+        }
+    }
+
+    #[test]
+    fn generic_rejection_with_headroom_does_not_use_weekly_reset() {
+        let backend = ClaudeBackend {
+            cooldown_ms: 1_800_000,
+        };
+        let map = headers(&[
+            (UNIFIED_STATUS, "rejected"),
+            (UNIFIED_RESET, "1792728000"),
+            (UNIFIED_5H_UTILIZATION, "0.23"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "0.18"),
+            (UNIFIED_7D_RESET, "1792728000"),
+        ]);
+        assert_eq!(backend.classify(429, "{}", &map, 1_000), Outcome::Transient);
+        assert_eq!(backend.exhausted_until_ms(&map), None);
+        assert_eq!(
+            backend.classify(429, "You have reached your weekly limit", &map, 1_000),
+            Outcome::QuotaExhausted {
+                until_ms: 1_792_728_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn weekly_exhaustion_uses_weekly_reset() {
+        let backend = ClaudeBackend {
+            cooldown_ms: 30_000,
+        };
+        let map = headers(&[
+            (UNIFIED_STATUS, "rejected"),
+            (UNIFIED_5H_UTILIZATION, "0.23"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "0.999"),
+            (UNIFIED_7D_RESET, "1792728000"),
+        ]);
+        assert_eq!(
+            backend.classify(429, "{}", &map, 1_000),
+            Outcome::QuotaExhausted {
+                until_ms: 1_792_728_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_usage_heals_only_quota_cooling_with_known_headroom() {
+        let mut account: Account = serde_json::from_value(json!({
+            "id": "claude", "backend": "claude", "label": "claude",
+            "status": "cooling", "reset_at": 1_792_728_000_000i64,
+            "created_at": 0, "updated_at": 0
+        }))
+        .unwrap();
+        let mut snapshot = parse_usage(
+            &json!({
+                "five_hour": {"utilization": 23.0, "resets_at": "2026-10-20T13:00:00Z"},
+                "seven_day": {"utilization": 18.0, "resets_at": "2026-10-27T00:00:00Z"}
+            }),
+            1_000,
+        );
+        assert_eq!(
+            snapshot.cooling_transition(&account, 1_000),
+            Some((AccountStatus::Healthy, 0))
+        );
+        for status in [AccountStatus::AuthError, AccountStatus::Disabled] {
+            account.status = status;
+            assert_eq!(snapshot.cooling_transition(&account, 1_000), None);
+            snapshot.seven_day.utilization = Some(1.0);
+            assert_eq!(snapshot.cooling_transition(&account, 1_000), None);
+            snapshot.seven_day.utilization = Some(0.18);
+        }
+        account.status = AccountStatus::Cooling;
+        for utilization in [None, Some(f64::NAN), Some(-0.1), Some(0.99), Some(1.0)] {
+            snapshot.five_hour.utilization = utilization;
+            assert_eq!(snapshot.cooling_transition(&account, 1_000), None);
+        }
+        snapshot.five_hour.utilization = Some(0.23);
+        snapshot.seven_day_fable.utilization = Some(1.0);
+        assert_eq!(snapshot.cooling_transition(&account, 1_000), None);
+        snapshot.seven_day_fable.utilization = None;
+        snapshot.seven_day.utilization = Some(1.0);
+        let weekly_reset = snapshot.seven_day.resets_at_ms.unwrap();
+        account.reset_at = weekly_reset + 1;
+        assert_eq!(
+            snapshot.cooling_transition(&account, 1_000),
+            None,
+            "verified block never shortens cooling"
+        );
+        account.reset_at = 0;
+        assert_eq!(
+            snapshot.cooling_transition(&account, 1_000),
+            Some((AccountStatus::Cooling, weekly_reset))
+        );
+    }
+
+    #[test]
     fn exhausted_window_is_read_from_the_response_headers() {
         let map = headers(&[
             ("anthropic-ratelimit-unified-status", "allowed"),
@@ -1381,6 +1641,37 @@ mod tests {
             backend.exhausted_until_ms(&map),
             Some(1_792_728_000_000),
             "only the exhausted weekly window counts"
+        );
+    }
+
+    #[test]
+    fn simultaneous_exhausted_windows_wait_for_the_latest_reset() {
+        let backend = ClaudeBackend {
+            cooldown_ms: 30_000,
+        };
+        let map = headers(&[
+            (UNIFIED_5H_UTILIZATION, "1.0"),
+            (UNIFIED_5H_RESET, "1792506000"),
+            (UNIFIED_7D_UTILIZATION, "1.0"),
+            (UNIFIED_7D_RESET, "1792728000"),
+        ]);
+        assert_eq!(backend.exhausted_until_ms(&map), Some(1_792_728_000_000));
+        assert_eq!(
+            backend.classify(429, "{}", &map, 1_000),
+            Outcome::QuotaExhausted {
+                until_ms: 1_792_728_000_000
+            }
+        );
+        let snapshot = parse_usage(
+            &json!({
+                "five_hour": {"utilization": 100.0, "resets_at": "2026-10-20T13:00:00Z"},
+                "seven_day": {"utilization": 100.0, "resets_at": "2026-10-27T00:00:00Z"}
+            }),
+            1_000,
+        );
+        assert_eq!(
+            snapshot.exhausted_reset_ms(),
+            snapshot.seven_day.resets_at_ms
         );
     }
 

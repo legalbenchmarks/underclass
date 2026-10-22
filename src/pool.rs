@@ -162,8 +162,8 @@ impl PoolCore {
     }
 
     /// @cc [owner:ghuntley,label:pool] model-cooldown-scopes-one-model
-    /// `report_model_quota` MUST record a cooldown for one model on one account until
-    /// `until_ms`, MUST NOT change the account's status, and MUST never shorten an existing
+    /// `report_model_quota` MUST record a quota or transient cooldown for one model on one account
+    /// until `until_ms`, MUST NOT change the account's status, and MUST never shorten an existing
     /// cooldown for the same account and model.
     pub fn report_model_quota(&mut self, account_id: &str, model: &str, until_ms: i64) {
         let models = self
@@ -186,11 +186,13 @@ impl PoolCore {
 
     /// @cc [owner:ghuntley,label:pool] select-sticky-healthy-never-unhealthy
     /// Selection MUST return, in priority order: (1) the account bound to the sticky key when it
-    /// is Healthy and serves the model (decision `StickyHit`); (2) on rebinding, a Healthy account
-    /// of the bound account's backend when one exists, else any Healthy eligible account; (3) for
+    /// is Healthy, serves the model, and has no active cooldown for it (decision `StickyHit`);
+    /// (2) on rebinding, a Healthy account of the bound account's backend when one exists,
+    /// else any Healthy eligible account; (3) for
     /// sticky misses, the least-in-flight Healthy eligible account. It MUST NOT ever return an
-    /// account that is Cooling, AuthError, or Disabled. When no eligible Healthy account exists it
-    /// MUST fail with `Saturated { until_ms = min reset_at over eligible cooling accounts }` or,
+    /// account that is Cooling, AuthError, Disabled, or cooling for the requested model.
+    /// When no eligible Healthy account exists it
+    /// MUST fail with `Saturated { until_ms = earliest eligible account/model cooldown }` or,
     /// if none are cooling, `NoAccounts`. Requests without a sticky key MUST NOT create bindings.
     /// Only backends that declare the requested `surface` are eligible.
     pub fn select(
@@ -249,6 +251,9 @@ impl PoolCore {
                         if state.account.healthy()
                             && backends.contains(&state.account.backend)
                             && !exclude.contains(&bound_id)
+                            && !self
+                                .model_cooling_until(&bound_id, model)
+                                .is_some_and(|until| until > now)
                         {
                             return Ok(Selection {
                                 account_id: bound_id.clone(),

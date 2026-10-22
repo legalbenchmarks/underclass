@@ -78,6 +78,20 @@ async fn mock_responses(
             .into_response();
     }
 
+    if bearer.starts_with("claude-overload-") && uri.path().ends_with("/messages") {
+        let status = if bearer.ends_with("529") { 529 } else { 429 };
+        return axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("anthropic-ratelimit-unified-status", "rejected")
+            .header("anthropic-ratelimit-unified-7d-status", "rejected")
+            .header("anthropic-ratelimit-unified-7d-utilization", "1.0")
+            .header("anthropic-ratelimit-unified-7d-reset", (now_ms() / 1000 + 6 * 86400).to_string())
+            .header("retry-after", "45")
+            .body(Body::from(r#"{"error":{"type":"overloaded_error","message":"Server is temporarily limiting requests (not your usage limit)"}}"#))
+            .unwrap();
+    }
+
     // A model-scoped refusal applies to one model only, the way Anthropic's weekly
     // other-models window does.
     let requested_model = serde_json::from_str::<serde_json::Value>(&body)
@@ -111,7 +125,7 @@ async fn mock_responses(
                     name("anthropic-ratelimit-unified-status"),
                     "rejected".to_string(),
                 ),
-                (name("anthropic-ratelimit-unified-reset"), reset),
+                (name("anthropic-ratelimit-unified-reset"), reset.clone()),
             ];
             if model_scoped {
                 headers.push((
@@ -126,6 +140,13 @@ async fn mock_responses(
                     name("anthropic-ratelimit-unified-7d_oi-status"),
                     "rejected".to_string(),
                 ));
+            }
+            if !model_scoped {
+                headers.push((
+                    name("anthropic-ratelimit-unified-7d-utilization"),
+                    "1.0".to_string(),
+                ));
+                headers.push((name("anthropic-ratelimit-unified-7d-reset"), reset));
             }
             let mut builder = axum::response::Response::builder()
                 .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
@@ -1289,6 +1310,49 @@ async fn e2e_anthropic_surface_serves_claude_code_clients_only() {
         "x-anthropic-billing-header: cc_version=2.1.304.c61; cc_entrypoint=sdk-cli;",
         "the request body travels upstream unchanged"
     );
+}
+
+#[tokio::test]
+async fn e2e_anthropic_overload_backs_off_without_cooling_account() {
+    mock_upstream();
+    for status in [429, 529] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.upsert_account(&account(
+            "claude-overload",
+            BackendId::Claude,
+            &format!("claude-overload-{status}"),
+        ));
+        let (base, _) = spawn_app(store.clone(), 1_800_000).await;
+        let request = || async {
+            reqwest::Client::new().post(format!("{base}/v1/messages"))
+                .header("Authorization", "Bearer test-key")
+                .header("x-app", "cli")
+                .header("user-agent", "claude-cli/2.1.304")
+                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-5-5", "max_tokens": 16,
+                    "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.304;"}],
+                    "messages": [{"role": "user", "content": "hi"}]
+                })).send().await.unwrap()
+        };
+        let response = request().await;
+        assert_eq!(response.status().as_u16(), status);
+        let a = store.list_accounts().pop().unwrap();
+        assert_eq!(a.status, AccountStatus::Healthy);
+        assert_eq!(a.reset_at, 0);
+        let retry = request().await;
+        assert_eq!(retry.status(), 429);
+        let wait: i64 = retry
+            .headers()
+            .get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=45).contains(&wait), "short model backoff, got {wait}");
+        assert_eq!(store.list_accounts()[0].status, AccountStatus::Healthy);
+    }
 }
 
 /// A Claude Code subscription window that is exhausted cools the account until the window
