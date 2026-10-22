@@ -292,6 +292,62 @@ fn test_recovery_is_latest_exhausted_window(tc: TestCase) {
 }
 
 #[hegel::test]
+fn test_claude_usage_headroom_cannot_heal_auth_or_disabled(tc: TestCase) {
+    let five: f64 = f64::from(tc.draw(gs::integers::<u8>().min_value(0).max_value(98))) / 100.0;
+    let seven: f64 = f64::from(tc.draw(gs::integers::<u8>().min_value(0).max_value(98))) / 100.0;
+    let current = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
+    let mut a = account("claude", BackendId::Claude);
+    a.reset_at = current;
+    let snapshot = underclass::claude::UsageSnapshot {
+        five_hour: underclass::claude::UsageWindow {
+            utilization: Some(five),
+            resets_at_ms: Some(current),
+        },
+        seven_day: underclass::claude::UsageWindow {
+            utilization: Some(seven),
+            resets_at_ms: Some(current),
+        },
+        ..Default::default()
+    };
+    a.status = AccountStatus::Cooling;
+    assert_eq!(
+        snapshot.cooling_transition(&a, 0),
+        Some((AccountStatus::Healthy, 0))
+    );
+    for status in [AccountStatus::AuthError, AccountStatus::Disabled] {
+        a.status = status;
+        assert_eq!(snapshot.cooling_transition(&a, 0), None);
+    }
+}
+
+#[hegel::test]
+fn test_sticky_selection_honors_model_backoff(tc: TestCase) {
+    let until = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
+    let mut built = build(1, 1);
+    let selected = built
+        .core
+        .select(0, Some("session"), "gpt-5.5", Surface::OpenAI)
+        .unwrap();
+    built
+        .core
+        .report_model_quota(&selected.account_id, "gpt-5.5", until);
+    assert!(
+        matches!(built.core.select(0, Some("session"), "gpt-5.5", Surface::OpenAI),
+        Err(SelectError::Saturated { until_ms }) if until_ms == until)
+    );
+    assert_eq!(
+        built.core.account(&selected.account_id).unwrap().status,
+        AccountStatus::Healthy
+    );
+    assert!(
+        built
+            .core
+            .select(until, Some("session"), "gpt-5.5", Surface::OpenAI)
+            .is_ok()
+    );
+}
+
+#[hegel::test]
 fn test_blocked_usage_never_shortens_cooling(tc: TestCase) {
     let current: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
     let recovery: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));

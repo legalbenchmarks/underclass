@@ -85,6 +85,12 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Optional per-model backoff after a transient response. This leaves account health intact
+    /// and MUST NOT derive its deadline from subscription quota resets.
+    fn transient_backoff_until_ms(&self, _headers: &HeaderMap, _now_ms: i64) -> Option<i64> {
+        None
+    }
+
     fn classify(&self, status: u16, _body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
         crate::health::classify(status, headers, self.default_cooldown_ms(), now_ms)
     }

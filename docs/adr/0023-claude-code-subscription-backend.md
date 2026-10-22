@@ -97,9 +97,22 @@ credential.
   a rejected shared five-hour or seven-day window blocks the credential across models, while a
   rejected model-scoped window (the weekly other-models window, overage, or an overage-disabled
   reason) blocks only that model on the account. A request-scoped refusal ("fast request
-  rejected", "credits are required") cools nothing. A 429 that says nothing at all cools
-  nothing either: underclass measured that Anthropic answers a request it refuses to serve with
+  rejected", "credits are required") does not cool the account. A 429 that says nothing at
+  all does not cool the account either: underclass measured that Anthropic answers a request it refuses to serve with
   exactly that shape, and cooling an account on it would be wrong.
+
+- **Overload is transient.** HTTP 529, `overloaded_error`, and messages saying
+  "temporarily limiting requests" or "not your usage limit" take precedence over quota
+  headers. They leave account health unchanged and back off the requested model using
+  `Retry-After`, or 60 seconds when absent. Sticky requests honor this backoff too.
+  A shared-window reset requires that window's utilization to be at least 99%, an explicit
+  per-window rejection, or a message explicitly saying that window's limit was reached.
+  Generic rejection/reset headers alone do not prove exhaustion.
+  Fresh usage showing both shared windows below 99% (and no observed exhausted model window)
+  readmits quota-cooling accounts, including deadlines persisted by older classifiers.
+  `Cooling` denotes quota blocks; `AuthError` and `Disabled` are distinct states and remain
+  unchanged. Missing/failed usage does not readmit an account. Evidence-backed blocks retain
+  the monotonic deadline rule from ADR 0017. No database migration is needed.
 
 - **Catalog**: `GET /v1/models` accepts the OAuth token (with `anthropic-version`), so the
   model list is fetched live like Copilot's, with a static seed as fallback.
